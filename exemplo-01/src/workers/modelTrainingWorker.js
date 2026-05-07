@@ -3,6 +3,7 @@ import { workerEvents } from '../events/constants.js';
 
 console.log('Model training worker initialized');
 let _globalCtx = {};
+let _model = null;
 
 const WEIGHTS = {
     category: 0.4,
@@ -130,28 +131,42 @@ function encodeUser(user, context) {
             context.dimensions
         ])
     }
+
+    return tf.concat1d(
+        [
+            tf.zeros([1]), // Price is ignored
+            tf.tensor1d([
+                normalize(user.age, context.minAge, context.maxAge) 
+                * WEIGHTS.age
+            ]),
+            tf.zeros([context.numCategories]), // Category is ignored
+            tf.zeros([context.numColors]), // Colors is ignored
+        ]
+    ).reshape([1, context.dimensions])
 }
 
 function createTrainingData(context) {
     const inputs = []
     const labels = []
 
-    context.users.forEach(user => {
-        const userVector = encodeUser(user, context).dataSync()
-        context.products.forEach(product => {
-            const productVector = encodeProduct(product, context).dataSync()
+    context.users
+        .filter(user => user.purchases.length)    
+        .forEach(user => {
+            const userVector = encodeUser(user, context).dataSync()
+            context.products.forEach(product => {
+                const productVector = encodeProduct(product, context).dataSync()
 
-            const label = user.purchases.some(
-                purchase => purchase.name === product.name ?
-                    1 :
-                    0
-            )
+                const label = user.purchases.some(
+                    purchase => purchase.name === product.name ?
+                        1 :
+                        0
+                )
 
-            //  combine user + product
-            inputs.push([...userVector, ...productVector])
-            labels.push(label)
+                //  combine user + product
+                inputs.push([...userVector, ...productVector])
+                labels.push(label)
+            })
         })
-    })
     
     return {
         xs: tf.tensor2d(inputs),
@@ -161,9 +176,94 @@ function createTrainingData(context) {
     }
 }
 
-async function trainModel({ users }) {
-    console.log('Training model with users:', users)
+async function configureNeuralNetAndTrain(trainData) {
+    const model = tf.sequential()
+    
+    /**
+     * Entry layer
+     * 
+     * - inputShape: Number of features for instance of train
+     * (trainData.inputDim)
+     *  Example: If the product vector + user = 20 numbers, So the inputDim = 20
+     * - Units: 128 Neurons (many "eyes"to detect the patterns)
+     * - activation: 'relu' (keeps only positive signals, it helps to learn non-linears patterns)
+     */
+    model.add(
+        tf.layers.dense({
+            inputShape: [trainData.inputDimension],
+            units: 128,
+            activation: 'relu'
+        })
+    )
+    /**
+     * Hidden layer 1
+     * - 64 neurons (less than the first layer: starting to compress the info)
+     * - activation: 'relu' (still extracting relevant combinations of features)
+     */
+    model.add(
+        tf.layers.dense({
+            units: 64,
+            activation: 'relu'
+        })
+    )
+    /**
+     * Hidden layer 2
+     * - 32 neurons (more narrow again, destiling the most important informations)
+     *  Example: From many signals, keeps only the strongest patterns
+     * - activation: 'relu'
+     */
+    model.add(
+        tf.layers.dense({
+            units: 32,
+            activation: 'relu'
+        })
+    )
+    /**
+     * Output Layer
+     * - 1 Neuron because we'll return only one recommndation point
+     * - activation: 'sigmoid'compress the result to 0-1 interval
+     *  Example: 
+     *  0.9 = strong recommendation
+     *  0,1 = weak recommendation
+     */ 
+    model.add(
+        tf.layers.dense({
+            units: 1, 
+            activation: 'sigmoid'
+        })
+    )
 
+    model.compile({
+        optimizer: tf.train.adam(0.01),
+        loss: 'binaryCrossentropy',
+		metrics: ['accuracy']
+    })
+
+    await model.fit(
+        trainData.xs,
+        trainData.ys,
+        {
+            epochs: 100,
+            batchSize: 32,
+            shuffle: true,
+            callbacks: {
+                onEpochEnd: (epoch, logs) => {
+                    postMessage({
+                        type: workerEvents.trainingLog,
+                        epoch,
+                        loss: logs.loss,
+                        accuracy: logs.acc
+                    });
+                }
+            }
+        }
+    )
+
+    return model
+    
+}
+
+async function trainModel({ users }) {
     postMessage({ type: workerEvents.progressUpdate, progress: { progress: 50 } });
     const products = await(await fetch('/data/products.json')).json()
 
@@ -177,29 +277,84 @@ async function trainModel({ users }) {
     // It should be in a vector DB
     _globalCtx = context
 
-    const trianData = createTrainingData(context)
-    debugger
+    const trainData = createTrainingData(context)
+    _model = await configureNeuralNetAndTrain(trainData)
 
-    postMessage({
-        type: workerEvents.trainingLog,
-        epoch: 1,
-        loss: 1,
-        accuracy: 1
-    });
+    postMessage({ type: workerEvents.progressUpdate, progress: { progress: 100 } });
+    postMessage({ type: workerEvents.trainingComplete });
 
-    setTimeout(() => {
-        postMessage({ type: workerEvents.progressUpdate, progress: { progress: 100 } });
-        postMessage({ type: workerEvents.trainingComplete });
-    }, 1000);
 }
 
 function recommend(user, ctx) {
-    console.log('will recommend for user:', user)
-    // postMessage({
-    //     type: workerEvents.recommend,
-    //     user,
-    //     recommendations: []
-    // });
+    if(!_model) return
+
+    /**
+     * Convert the provided user into a codified vectorized features
+     * 
+     *  (price ignored, normalized age, categories ignored, cores ignored)
+     * 
+     * It transform the user's info into the same numeric format that was used to train the model
+     */
+    const vetorizedUser = encodeUser(user, ctx).dataSync()
+
+    /**
+     * ⚠️‼️ For Real Apps
+     * 
+     * Store ALL product vectors in a vectorial DB (like Postgres (with vector plugin), Neo4j,
+     * Pinecone, ChromaDB...)
+     * 
+     * Query to DB: Find the 200 closest products for the user's vector
+     * 
+     * Execute: _model.predict() ONLY on these products
+     */
+
+
+    /**
+     * create pair of entries: for each product, concat the user's vector with
+     * the product's vector
+     * Why? the model predict the "compatibility score" for each pair (user, product)
+     */
+    const inputs = ctx.productVectors.map(({vector}) => {
+        return [...vetorizedUser, ...vector]
+    })
+
+    /**
+     * Converts all these pairs (user, product) into only one Tensor
+     * Format: [numProducts, inputDim]
+     */
+    const inputTensor = tf.tensor2d(inputs)
+
+    /**
+     * Run the trained neural net against every pairs (user, product) at once
+     * 
+     * The result is a pontuation or each product between 0 and 1
+     * As bigger it is bigger os the probability of the user want that product
+     */
+    const predictions = _model.predict(inputTensor)
+
+    /**
+     * Extract the scores to an regular JS array 
+     */
+    const scores = predictions.dataSync()
+    
+    const recommmendations = ctx.productVectors.map((item, index) => ({
+        ...item.meta,
+        name: item.name,
+        score: scores[index], // model prediction for this product
+    }))
+
+    const sortedItems = recommmendations
+        .sort((a,b) => b.score - a.score)
+
+    /**
+     * Send the poroducts recommendations sorted list to the main thread
+     * (Ui to display them)
+     */
+    postMessage({
+        type: workerEvents.recommend,
+        user,
+        recommendations: sortedItems
+    });
 }
 
 const handlers = {
