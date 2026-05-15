@@ -1,0 +1,21 @@
+{
+  "extends": [
+    "./eslint/eslint-defaults.json",
+    "./eslint/eslint-babel.json"
+  ],
+  "parser": "babel-eslint",
+  "env" : {
+    "browser": true,
+    "es6": true
+  },
+  "rules": {
+    "no-debugger": "off"
+  },
+  "parserOptions": {
+    "ecmaVersion": 2020,
+    "sourceType": "module",
+    "imports": {
+      "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest": ["*"]
+    }
+  }
+}
